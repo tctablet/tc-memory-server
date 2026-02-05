@@ -12,12 +12,60 @@ import { deleteKnowledgeTool } from "./tools/delete-knowledge.js";
 
 const PORT = parseInt(process.env.PORT || "3333", 10);
 
+console.log("[startup] TC Memory Server starting...");
+console.log("[startup] NODE_VERSION:", process.version);
+console.log("[startup] PORT:", PORT);
+console.log("[startup] DATABASE_URL:", process.env.DATABASE_URL ? "set (host: " + (process.env.DATABASE_URL.match(/@([^:]+):/)?.[1] ?? "unknown") + ")" : "NOT SET");
+console.log("[startup] TC_MEMORY_TOKEN:", process.env.TC_MEMORY_TOKEN ? "set" : "NOT SET");
+
+async function initDbWithRetry(maxRetries = 5, delayMs = 3000): Promise<void> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[db] Connection attempt ${attempt}/${maxRetries}...`);
+      await initDb();
+      console.log("[db] Database initialized successfully");
+      return;
+    } catch (err) {
+      console.error(`[db] Attempt ${attempt} failed:`, err instanceof Error ? err.message : err);
+      if (attempt < maxRetries) {
+        console.log(`[db] Retrying in ${delayMs}ms...`);
+        await new Promise(r => setTimeout(r, delayMs));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
 async function main() {
-  // Initialize database
-  await initDb();
-  console.log("Database initialized");
+  // Create Express app first so health check works even if DB is down
+  const app = express();
+  app.use(express.json());
+  app.use(authMiddleware);
+
+  let dbReady = false;
+
+  // Health check (no auth required - handled in authMiddleware)
+  app.get("/health", (_req, res) => {
+    res.json({ status: dbReady ? "ok" : "starting", server: "tc-memory", version: "1.0.0", db: dbReady });
+  });
+
+  // Start HTTP server immediately so container stays alive
+  const server = app.listen(PORT, () => {
+    console.log(`[startup] HTTP server listening on port ${PORT}`);
+  });
+
+  // Initialize database with retries
+  try {
+    await initDbWithRetry();
+    dbReady = true;
+  } catch (err) {
+    console.error("[startup] Database initialization failed after all retries:", err);
+    console.error("[startup] Server will stay up but DB-dependent routes will fail");
+  }
 
   // Create MCP Server
+  console.log("[startup] Registering MCP tools...");
   const mcpServer = new McpServer({
     name: "tc-memory",
     version: "1.0.0",
@@ -28,20 +76,14 @@ async function main() {
   for (const tool of tools) {
     mcpServer.tool(tool.name, tool.config.description, tool.config.inputSchema, tool.handler);
   }
-
-  // Create Express app
-  const app = express();
-  app.use(express.json());
-  app.use(authMiddleware);
-
-  // Health check (no auth required - handled in authMiddleware)
-  app.get("/health", (_req, res) => {
-    res.json({ status: "ok", server: "tc-memory", version: "1.0.0" });
-  });
+  console.log(`[startup] ${tools.length} MCP tools registered`);
 
   // MCP Streamable HTTP endpoint
-  // Each request gets its own transport for stateless operation
   app.all("/mcp", async (req, res) => {
+    if (!dbReady) {
+      res.status(503).json({ error: "Database not ready" });
+      return;
+    }
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // Stateless mode
     });
@@ -78,15 +120,13 @@ async function main() {
     }
   });
 
-  app.listen(PORT, () => {
-    console.log(`TC Memory Server running on port ${PORT}`);
-    console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
-    console.log(`REST API: http://localhost:${PORT}/api/recent`);
-    console.log(`Health: http://localhost:${PORT}/health`);
-  });
+  console.log("[startup] All routes registered");
+  console.log(`[startup] MCP endpoint: http://localhost:${PORT}/mcp`);
+  console.log(`[startup] REST API: http://localhost:${PORT}/api/recent`);
+  console.log(`[startup] Health: http://localhost:${PORT}/health`);
 }
 
 main().catch((err) => {
-  console.error("Fatal error:", err);
+  console.error("[fatal]", err);
   process.exit(1);
 });
