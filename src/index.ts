@@ -47,7 +47,7 @@ async function main() {
 
   // Health check (no auth required - handled in authMiddleware)
   app.get("/health", (_req, res) => {
-    res.json({ status: dbReady ? "ok" : "starting", server: "tc-memory", version: "1.0.0", db: dbReady });
+    res.json({ status: dbReady ? "ok" : "starting", server: "tc-memory", version: "1.0.1", db: dbReady });
   });
 
   // Start HTTP server immediately so container stays alive
