@@ -40,8 +40,12 @@ async function initDbWithRetry(maxRetries = 5, delayMs = 3000): Promise<void> {
 async function main() {
   // Create Express app first so health check works even if DB is down
   const app = express();
-  app.use(express.json());
   app.use(authMiddleware);
+  // express.json() only for REST routes, NOT for /mcp (MCP transport reads raw body)
+  app.use((req, res, next) => {
+    if (req.path === "/mcp") return next();
+    express.json()(req, res, next);
+  });
 
   let dbReady = false;
 
