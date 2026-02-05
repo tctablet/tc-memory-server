@@ -13,6 +13,8 @@ const SEARCH_VECTOR_EXPR = `
 // Initialize schema and table
 export async function initDb(): Promise<void> {
   await pool.query(`CREATE SCHEMA IF NOT EXISTS tc_memory`);
+  // Enable pg_trgm for fuzzy/trigram search fallback
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS pg_trgm`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tc_memory.knowledge (
       id            SERIAL PRIMARY KEY,
@@ -67,6 +69,13 @@ export async function initDb(): Promise<void> {
   `);
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_knowledge_tags ON tc_memory.knowledge USING GIN(tags)
+  `);
+  // Trigram indexes for fuzzy search fallback
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_knowledge_topic_trgm ON tc_memory.knowledge USING GIN(topic gin_trgm_ops)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_knowledge_content_trgm ON tc_memory.knowledge USING GIN(content gin_trgm_ops)
   `);
 }
 
@@ -153,6 +162,39 @@ export async function searchKnowledge(
   params.push(Math.min(limit, 50));
 
   const result = await pool.query<KnowledgeRow>(sql, params);
+
+  // Fallback to trigram similarity search if tsvector returns no results
+  if (result.rows.length === 0 && query.trim().length >= 2) {
+    let fuzzySql = `
+      SELECT *,
+        GREATEST(
+          similarity(topic, $1),
+          similarity(content, $1)
+        ) AS rank
+      FROM tc_memory.knowledge
+      WHERE (topic % $1 OR content % $1)
+    `;
+    const fuzzyParams: (string | string[] | number)[] = [query];
+    let fuzzyIdx = 2;
+
+    if (source) {
+      fuzzySql += ` AND source = $${fuzzyIdx}`;
+      fuzzyParams.push(source);
+      fuzzyIdx++;
+    }
+    if (tags && tags.length > 0) {
+      fuzzySql += ` AND tags && $${fuzzyIdx}`;
+      fuzzyParams.push(tags);
+      fuzzyIdx++;
+    }
+
+    fuzzySql += ` ORDER BY rank DESC LIMIT $${fuzzyIdx}`;
+    fuzzyParams.push(Math.min(limit, 50));
+
+    const fuzzyResult = await pool.query<KnowledgeRow>(fuzzySql, fuzzyParams);
+    return fuzzyResult.rows;
+  }
+
   return result.rows;
 }
 

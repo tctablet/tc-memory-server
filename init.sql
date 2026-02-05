@@ -2,6 +2,7 @@
 -- Run once on the PostgreSQL instance
 
 CREATE SCHEMA IF NOT EXISTS tc_memory;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS tc_memory.knowledge (
   id            SERIAL PRIMARY KEY,
@@ -42,3 +43,5 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_source ON tc_memory.knowledge(source);
 CREATE INDEX IF NOT EXISTS idx_knowledge_topic ON tc_memory.knowledge(topic);
 CREATE INDEX IF NOT EXISTS idx_knowledge_created ON tc_memory.knowledge(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_knowledge_tags ON tc_memory.knowledge USING GIN(tags);
+CREATE INDEX IF NOT EXISTS idx_knowledge_topic_trgm ON tc_memory.knowledge USING GIN(topic gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_knowledge_content_trgm ON tc_memory.knowledge USING GIN(content gin_trgm_ops);
