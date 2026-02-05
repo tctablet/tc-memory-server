@@ -163,27 +163,31 @@ export async function searchKnowledge(
 
   const result = await pool.query<KnowledgeRow>(sql, params);
 
-  // Fallback to trigram similarity search if tsvector returns no results
+  // Fallback: split query into words, ILIKE match any word against topic/content
   if (result.rows.length === 0 && query.trim().length >= 2) {
+    const words = query.split(/[\s\-_,;.]+/).filter((w) => w.length >= 3);
+    if (words.length === 0) return [];
+
+    const patterns = words.map((w) => `%${w}%`);
+
     let fuzzySql = `
-      SELECT *,
-        GREATEST(
-          similarity(topic, $1),
-          similarity(content, $1)
-        ) AS rank
-      FROM tc_memory.knowledge
-      WHERE (topic % $1 OR content % $1)
+      SELECT k.*,
+        (SELECT COUNT(*)::float FROM unnest($1::text[]) AS pattern
+         WHERE k.topic ILIKE pattern OR k.content ILIKE pattern
+        ) / cardinality($1::text[]) AS rank
+      FROM tc_memory.knowledge k
+      WHERE k.topic ILIKE ANY($1) OR k.content ILIKE ANY($1)
     `;
-    const fuzzyParams: (string | string[] | number)[] = [query];
+    const fuzzyParams: (string[] | string | number)[] = [patterns];
     let fuzzyIdx = 2;
 
     if (source) {
-      fuzzySql += ` AND source = $${fuzzyIdx}`;
+      fuzzySql += ` AND k.source = $${fuzzyIdx}`;
       fuzzyParams.push(source);
       fuzzyIdx++;
     }
     if (tags && tags.length > 0) {
-      fuzzySql += ` AND tags && $${fuzzyIdx}`;
+      fuzzySql += ` AND k.tags && $${fuzzyIdx}`;
       fuzzyParams.push(tags);
       fuzzyIdx++;
     }
