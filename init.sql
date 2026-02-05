@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS tc_memory.knowledge (
   tags          TEXT[] DEFAULT '{}',
   confidence    REAL DEFAULT 1.0,
   search_vector TSVECTOR,
+  user_id       TEXT DEFAULT 'unknown',
   created_at    TIMESTAMPTZ DEFAULT NOW(),
   updated_at    TIMESTAMPTZ DEFAULT NOW()
 );

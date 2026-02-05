@@ -3,7 +3,7 @@ import { saveKnowledge } from "../db.js";
 
 const VALID_SOURCES = [
   "website", "godot-pay", "godot-tablet", "godot-mgmt",
-  "gas", "devops", "stripe", "unknown",
+  "gas", "devops", "stripe", "infrastructure", "unknown",
 ];
 
 export const saveKnowledgeTool = {
@@ -17,18 +17,20 @@ export const saveKnowledgeTool = {
       source: z.enum(VALID_SOURCES as [string, ...string[]]).describe("Agent/project ID that produced this knowledge"),
       tags: z.array(z.string()).max(10).optional().describe("Optional tags for filtering (e.g. ['breaking-change', 'config'])"),
       confidence: z.number().min(0).max(1).optional().describe("Confidence score 0-1 (default 1.0)"),
+      user: z.string().max(50).optional().describe("Developer identifier (e.g. 'cpg', 'gpopp'). Defaults to 'unknown'."),
     },
   },
-  handler: async ({ topic, content, source, tags, confidence }: {
+  handler: async ({ topic, content, source, tags, confidence, user }: {
     topic: string;
     content: string;
     source: string;
     tags?: string[];
     confidence?: number;
+    user?: string;
   }) => {
-    const id = await saveKnowledge(topic, content, source, tags ?? [], confidence ?? 1.0);
+    const id = await saveKnowledge(topic, content, source, tags ?? [], confidence ?? 1.0, user ?? "unknown");
     return {
-      content: [{ type: "text" as const, text: JSON.stringify({ id, message: "Saved", topic, source }) }],
+      content: [{ type: "text" as const, text: JSON.stringify({ id, message: "Saved", topic, source, user: user ?? "unknown" }) }],
     };
   },
 };

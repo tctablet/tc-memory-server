@@ -26,6 +26,10 @@ export async function initDb(): Promise<void> {
       updated_at    TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  // Add user_id column if not exists (migration for existing deployments)
+  await pool.query(`
+    ALTER TABLE tc_memory.knowledge ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT 'unknown'
+  `);
   // Create trigger to auto-update search_vector
   await pool.query(`
     CREATE OR REPLACE FUNCTION tc_memory.update_search_vector() RETURNS trigger AS $$
@@ -71,6 +75,7 @@ export interface KnowledgeRow {
   topic: string;
   content: string;
   source: string;
+  user_id: string;
   tags: string[];
   confidence: number;
   created_at: Date;
@@ -83,7 +88,8 @@ export async function saveKnowledge(
   content: string,
   source: string,
   tags: string[],
-  confidence: number
+  confidence: number,
+  userId: string = "unknown"
 ): Promise<number> {
   // Duplicate check: same topic + source + similar content → update
   const existing = await pool.query<KnowledgeRow>(
@@ -96,18 +102,18 @@ export async function saveKnowledge(
   if (existing.rows.length > 0) {
     await pool.query(
       `UPDATE tc_memory.knowledge
-       SET content = $1, tags = $2, confidence = $3, updated_at = NOW()
-       WHERE id = $4`,
-      [content, tags, confidence, existing.rows[0].id]
+       SET content = $1, tags = $2, confidence = $3, user_id = $4, updated_at = NOW()
+       WHERE id = $5`,
+      [content, tags, confidence, userId, existing.rows[0].id]
     );
     return existing.rows[0].id;
   }
 
   const result = await pool.query<{ id: number }>(
-    `INSERT INTO tc_memory.knowledge (topic, content, source, tags, confidence)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO tc_memory.knowledge (topic, content, source, tags, confidence, user_id)
+     VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING id`,
-    [topic, content, source, tags, confidence]
+    [topic, content, source, tags, confidence, userId]
   );
   return result.rows[0].id;
 }

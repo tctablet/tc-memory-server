@@ -25,6 +25,7 @@ export const searchKnowledgeTool = {
       topic: r.topic,
       content: r.content,
       source: r.source,
+      user: r.user_id,
       tags: r.tags,
       confidence: r.confidence,
       created_at: r.created_at,

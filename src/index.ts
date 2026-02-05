@@ -96,9 +96,16 @@ async function main() {
     try {
       const hours = parseInt(req.query.hours as string) || 48;
       const source = req.query.source as string | undefined;
-      const changes = await getRecentChanges(hours, source);
+      const limit = parseInt(req.query.limit as string) || 20;
+      const changes = await getRecentChanges(hours, source, limit);
       const text = changes
-        .map((c) => `[${c.source}] ${c.topic}: ${c.content}`)
+        .map((c) => {
+          const time = new Date(c.created_at).toISOString().slice(0, 16).replace("T", " ");
+          const user = c.user_id && c.user_id !== "unknown" ? `${c.user_id}:` : "";
+          // Truncate content to first 120 chars for compact hook output
+          const short = c.content.length > 120 ? c.content.slice(0, 117) + "..." : c.content;
+          return `[${time}] ${user}${c.source} | ${c.topic}: ${short}`;
+        })
         .join("\n");
       res.type("text/plain").send(text || "No recent changes");
     } catch (err) {
@@ -108,12 +115,12 @@ async function main() {
 
   app.post("/api/save", async (req, res) => {
     try {
-      const { topic, content, source, tags, confidence } = req.body;
+      const { topic, content, source, tags, confidence, user } = req.body;
       if (!topic || !content || !source) {
         res.status(400).json({ error: "Missing required fields: topic, content, source" });
         return;
       }
-      const id = await saveKnowledge(topic, content, source, tags ?? [], confidence ?? 1.0);
+      const id = await saveKnowledge(topic, content, source, tags ?? [], confidence ?? 1.0, user ?? "unknown");
       res.json({ id, message: "Saved" });
     } catch (err) {
       res.status(500).json({ error: "Failed to save knowledge" });

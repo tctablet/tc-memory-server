@@ -23,6 +23,7 @@ export const recentChangesTool = {
       topic: r.topic,
       content: r.content,
       source: r.source,
+      user: r.user_id,
       tags: r.tags,
       created_at: r.created_at,
     }));
