@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { initDb, saveKnowledge, getRecentChanges } from "./db.js";
+import { initDb, saveKnowledge, getRecentChanges, searchKnowledge } from "./db.js";
 import { authMiddleware } from "./auth.js";
 import { saveKnowledgeTool } from "./tools/save-knowledge.js";
 import { searchKnowledgeTool } from "./tools/search-knowledge.js";
@@ -113,6 +113,32 @@ async function main() {
     }
   });
 
+  app.get("/api/search", async (req, res) => {
+    try {
+      const query = req.query.query as string;
+      if (!query) {
+        res.status(400).json({ error: "Missing required parameter: query" });
+        return;
+      }
+      const source = req.query.source as string | undefined;
+      const limit = parseInt(req.query.limit as string) || 10;
+      const tagsParam = req.query.tags as string | undefined;
+      const tags = tagsParam ? tagsParam.split(",") : undefined;
+      const results = await searchKnowledge(query, source, tags, limit);
+      const text = results
+        .map((r) => {
+          const time = new Date(r.created_at).toISOString().slice(0, 16).replace("T", " ");
+          const user = r.user_id && r.user_id !== "unknown" ? `${r.user_id}:` : "";
+          const short = r.content.length > 200 ? r.content.slice(0, 197) + "..." : r.content;
+          return `[${time}] ${user}${r.source} | ${r.topic}: ${short}`;
+        })
+        .join("\n");
+      res.type("text/plain").send(text || "No results");
+    } catch (err) {
+      res.status(500).json({ error: "Search failed" });
+    }
+  });
+
   app.post("/api/save", async (req, res) => {
     try {
       const { topic, content, source, tags, confidence, user } = req.body;
@@ -129,7 +155,7 @@ async function main() {
 
   console.log("[startup] All routes registered");
   console.log(`[startup] MCP endpoint: http://localhost:${PORT}/mcp`);
-  console.log(`[startup] REST API: http://localhost:${PORT}/api/recent`);
+  console.log(`[startup] REST API: http://localhost:${PORT}/api/recent, /api/search`);
   console.log(`[startup] Health: http://localhost:${PORT}/health`);
 }
 
