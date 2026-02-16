@@ -2,13 +2,16 @@ import "dotenv/config";
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { initDb, saveKnowledge, getRecentChanges, searchKnowledge } from "./db.js";
+import { initDb, saveKnowledge, getRecentChanges, searchKnowledge, getHealthReport, pruneStaleEntries } from "./db.js";
 import { authMiddleware } from "./auth.js";
 import { saveKnowledgeTool } from "./tools/save-knowledge.js";
 import { searchKnowledgeTool } from "./tools/search-knowledge.js";
 import { recentChangesTool } from "./tools/recent-changes.js";
 import { listTopicsTool } from "./tools/list-topics.js";
 import { deleteKnowledgeTool } from "./tools/delete-knowledge.js";
+import { memoryHealthTool } from "./tools/memory-health.js";
+import { findDuplicatesTool } from "./tools/find-duplicates.js";
+import { mergeKnowledgeTool } from "./tools/merge-knowledge.js";
 
 const PORT = parseInt(process.env.PORT || "3333", 10);
 
@@ -72,7 +75,7 @@ async function main() {
   });
 
   // Register all tools
-  const tools = [saveKnowledgeTool, searchKnowledgeTool, recentChangesTool, listTopicsTool, deleteKnowledgeTool];
+  const tools = [saveKnowledgeTool, searchKnowledgeTool, recentChangesTool, listTopicsTool, deleteKnowledgeTool, memoryHealthTool, findDuplicatesTool, mergeKnowledgeTool];
   for (const tool of tools) {
     mcpServer.tool(tool.name, tool.config.description, tool.config.inputSchema, tool.handler);
   }
@@ -141,15 +144,36 @@ async function main() {
 
   app.post("/api/save", async (req, res) => {
     try {
-      const { topic, content, source, tags, confidence, user } = req.body;
+      const { topic, content, source, tags, confidence, user, memory_type } = req.body;
       if (!topic || !content || !source) {
         res.status(400).json({ error: "Missing required fields: topic, content, source" });
         return;
       }
-      const id = await saveKnowledge(topic, content, source, tags ?? [], confidence ?? 1.0, user ?? "unknown");
+      const id = await saveKnowledge(topic, content, source, tags ?? [], confidence ?? 1.0, user ?? "unknown", memory_type);
       res.json({ id, message: "Saved" });
     } catch (err) {
       res.status(500).json({ error: "Failed to save knowledge" });
+    }
+  });
+
+  // Phase 2: Health report endpoint
+  app.get("/api/health-report", async (_req, res) => {
+    try {
+      const report = await getHealthReport();
+      res.json(report);
+    } catch (err) {
+      res.status(500).json({ error: "Failed to generate health report" });
+    }
+  });
+
+  // Phase 3: Prune stale entries endpoint
+  app.post("/api/prune", async (req, res) => {
+    try {
+      const dryRun = req.query.dry_run !== "false";
+      const result = await pruneStaleEntries(dryRun);
+      res.json({ dry_run: dryRun, ...result });
+    } catch (err) {
+      res.status(500).json({ error: "Prune operation failed" });
     }
   });
 

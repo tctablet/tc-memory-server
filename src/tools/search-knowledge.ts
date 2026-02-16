@@ -28,6 +28,8 @@ export const searchKnowledgeTool = {
       user: r.user_id,
       tags: r.tags,
       confidence: r.confidence,
+      memory_type: r.memory_type,
+      access_count: r.access_count,
       created_at: r.created_at,
       rank: r.rank,
     }));

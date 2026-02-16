@@ -13,8 +13,12 @@ CREATE TABLE IF NOT EXISTS tc_memory.knowledge (
   confidence    REAL DEFAULT 1.0,
   search_vector TSVECTOR,
   user_id       TEXT DEFAULT 'unknown',
+  access_count  INT DEFAULT 0,
+  last_accessed TIMESTAMPTZ,
+  memory_type   TEXT DEFAULT 'pattern',
   created_at    TIMESTAMPTZ DEFAULT NOW(),
-  updated_at    TIMESTAMPTZ DEFAULT NOW()
+  updated_at    TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT chk_memory_type CHECK (memory_type IN ('core', 'architecture', 'pattern', 'decision'))
 );
 
 -- Trigger to auto-update search_vector on insert/update
@@ -45,3 +49,5 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_created ON tc_memory.knowledge(created_
 CREATE INDEX IF NOT EXISTS idx_knowledge_tags ON tc_memory.knowledge USING GIN(tags);
 CREATE INDEX IF NOT EXISTS idx_knowledge_topic_trgm ON tc_memory.knowledge USING GIN(topic gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_knowledge_content_trgm ON tc_memory.knowledge USING GIN(content gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_knowledge_last_accessed ON tc_memory.knowledge(last_accessed DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_knowledge_memory_type ON tc_memory.knowledge(memory_type);
