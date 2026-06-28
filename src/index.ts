@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { initDb, saveKnowledge, getRecentChanges, searchKnowledge, getHealthReport, pruneStaleEntries } from "./db.js";
+import { initDb, saveKnowledge, getRecentChanges, searchKnowledge, getHealthReport, pruneStaleEntries, pool } from "./db.js";
 import { authMiddleware } from "./auth.js";
 import { saveKnowledgeTool } from "./tools/save-knowledge.js";
 import { searchKnowledgeTool } from "./tools/search-knowledge.js";
@@ -50,7 +50,7 @@ async function main() {
 
   // Health check (no auth required - handled in authMiddleware)
   app.get("/health", (_req, res) => {
-    res.json({ status: dbReady ? "ok" : "starting", server: "tc-memory", version: "1.0.1", db: dbReady });
+    res.json({ status: dbReady ? "ok" : "starting", server: "tc-memory", version: "1.1.0", db: dbReady });
   });
 
   // Start HTTP server immediately so container stays alive
@@ -174,6 +174,26 @@ async function main() {
       res.json({ dry_run: dryRun, ...result });
     } catch (err) {
       res.status(500).json({ error: "Prune operation failed" });
+    }
+  });
+
+  // Full read-only export (auth-protected) — backup + local-eval seeding.
+  // Returns every row with full content so the corpus can be snapshotted/restored.
+  app.get("/api/export", async (_req, res) => {
+    if (!dbReady) {
+      res.status(503).json({ error: "Database not ready" });
+      return;
+    }
+    try {
+      const { rows } = await pool.query(
+        `SELECT id, topic, content, source, user_id, tags, confidence,
+                memory_type, access_count, last_accessed, created_at, updated_at
+         FROM tc_memory.knowledge
+         ORDER BY id ASC`
+      );
+      res.json({ count: rows.length, exported_at: new Date().toISOString(), entries: rows });
+    } catch (err) {
+      res.status(500).json({ error: "Export failed" });
     }
   });
 
