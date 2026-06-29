@@ -7,8 +7,10 @@ const pool = new pg.Pool({
 // Initialize schema and table
 export async function initDb(): Promise<void> {
   await pool.query(`CREATE SCHEMA IF NOT EXISTS tc_memory`);
-  // Enable pg_trgm for fuzzy/trigram search fallback
+  // Enable pg_trgm for fuzzy/trigram search fallback + word_similarity ranking co-signal
   await pool.query(`CREATE EXTENSION IF NOT EXISTS pg_trgm`);
+  // Enable unaccent so umlaut/accent variants (ä/ö/ü/é …) match consistently
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS unaccent`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tc_memory.knowledge (
       id            SERIAL PRIMARY KEY,
@@ -48,14 +50,16 @@ export async function initDb(): Promise<void> {
       END IF;
     END $$
   `);
-  // Create trigger to auto-update search_vector
+  // Create trigger to auto-update search_vector.
+  // Topic = weight A (metadata is the primary retrieval signal), content = B, tags = C.
+  // unaccent() normalises ä/ö/ü/é etc. so accented queries match accented content.
   await pool.query(`
     CREATE OR REPLACE FUNCTION tc_memory.update_search_vector() RETURNS trigger AS $$
     BEGIN
       NEW.search_vector :=
-        setweight(to_tsvector('german', COALESCE(NEW.topic, '')), 'A') ||
-        setweight(to_tsvector('german', COALESCE(NEW.content, '')), 'B') ||
-        setweight(to_tsvector('simple', COALESCE(array_to_string(NEW.tags, ' '), '')), 'C');
+        setweight(to_tsvector('german', unaccent(COALESCE(NEW.topic, ''))), 'A') ||
+        setweight(to_tsvector('german', unaccent(COALESCE(NEW.content, ''))), 'B') ||
+        setweight(to_tsvector('simple', unaccent(COALESCE(array_to_string(NEW.tags, ' '), ''))), 'C');
       RETURN NEW;
     END;
     $$ LANGUAGE plpgsql
@@ -120,6 +124,23 @@ export async function initDb(): Promise<void> {
            OR topic ILIKE '%pricing%' OR topic ILIKE '%stripe-api%'
            OR topic ILIKE '%infrastructure%' OR topic ILIKE '%architecture%'
            OR topic ILIKE '%invoice-pdf%')
+  `);
+  // One-time: recompute search_vector for existing rows under the new unaccent trigger.
+  // Guarded by a schema_meta marker so it does NOT rewrite the whole table on every boot.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tc_memory.schema_meta (key TEXT PRIMARY KEY, value TEXT)
+  `);
+  await pool.query(`
+    DO $$ BEGIN
+      IF (SELECT value FROM tc_memory.schema_meta WHERE key = 'search_vector_version') IS DISTINCT FROM '2' THEN
+        UPDATE tc_memory.knowledge SET search_vector =
+          setweight(to_tsvector('german', unaccent(COALESCE(topic, ''))), 'A') ||
+          setweight(to_tsvector('german', unaccent(COALESCE(content, ''))), 'B') ||
+          setweight(to_tsvector('simple', unaccent(COALESCE(array_to_string(tags, ' '), ''))), 'C');
+        INSERT INTO tc_memory.schema_meta (key, value) VALUES ('search_vector_version', '2')
+          ON CONFLICT (key) DO UPDATE SET value = '2';
+      END IF;
+    END $$
   `);
 }
 
@@ -230,25 +251,101 @@ export async function saveKnowledge(
   return result.rows[0].id;
 }
 
+export interface NearMatch {
+  id: number;
+  topic: string;
+  source: string;
+  user_id: string;
+  memory_type: MemoryType;
+  access_count: number;
+  similarity: number;
+  preview: string;
+}
+
+// Surface existing entries that look like duplicates of a would-be new entry.
+// Same topic slug is the strongest signal (catches the traefik/authelia/drive-photo
+// multi-row dupes); pg_trgm similarity over topic+content catches near-duplicates.
+export async function findNearMatches(
+  topic: string,
+  content: string,
+  threshold: number = 0.5
+): Promise<NearMatch[]> {
+  const probe = `${topic} ${content}`;
+  const result = await pool.query<NearMatch>(
+    `SELECT id, topic, source, user_id, memory_type, access_count,
+            ROUND(similarity($1, topic || ' ' || content)::numeric, 3)::float AS similarity,
+            LEFT(content, 160) AS preview
+     FROM tc_memory.knowledge
+     WHERE topic = $2
+        OR similarity($1, topic || ' ' || content) > $3
+     ORDER BY (topic = $2) DESC, similarity DESC
+     LIMIT 5`,
+    [probe, topic, threshold]
+  );
+  return result.rows;
+}
+
+// Merge new knowledge into an existing entry (used by the save-gate's merge_into path):
+// overwrite content with the (presumably consolidated) text, union tags, raise confidence.
+export async function updateKnowledge(
+  id: number,
+  content: string,
+  tags?: string[],
+  confidence?: number,
+  userId?: string,
+  memoryType?: MemoryType
+): Promise<boolean> {
+  const existing = await pool.query<KnowledgeRow>(
+    `SELECT * FROM tc_memory.knowledge WHERE id = $1`,
+    [id]
+  );
+  if (existing.rows.length === 0) return false;
+  const cur = existing.rows[0];
+  const mergedTags = tags && tags.length > 0 ? [...new Set([...cur.tags, ...tags])] : cur.tags;
+  const newConfidence = confidence !== undefined ? Math.max(cur.confidence, confidence) : cur.confidence;
+  await pool.query(
+    `UPDATE tc_memory.knowledge
+     SET content = $1, tags = $2, confidence = $3, user_id = COALESCE($4, user_id),
+         memory_type = COALESCE($5, memory_type), updated_at = NOW()
+     WHERE id = $6`,
+    [content, mergedTags, newConfidence, userId ?? null, memoryType ?? null, id]
+  );
+  return true;
+}
+
 export async function searchKnowledge(
   query: string,
   source?: string,
   tags?: string[],
   limit: number = 10
 ): Promise<KnowledgeRow[]> {
+  // OR-of-prefixes (recall): match ANY query term instead of requiring ALL of them.
+  // ts_rank still rewards docs that match MORE terms and higher-weighted fields (topic=A),
+  // so precision is kept via ranking rather than via a brittle AND filter that tanked recall
+  // (e.g. "traefik labels configuration" used to return nothing because no entry had all three).
+  // unaccent() mirrors the indexed search_vector so accented queries match.
   const tsQuery = query
     .split(/\s+/)
     .filter(Boolean)
-    .map((w) => w + ":*")
-    .join(" & ");
+    .map((w) => w.replace(/[():&|!*]/g, "") + ":*")
+    .filter((t) => t.length > 2)
+    .join(" | ");
 
+  if (!tsQuery) return [];
+
+  // Combined rank = full-text rank + a topic word_similarity co-signal that rewards
+  // topic-slug closeness and breaks ts_rank ties (which otherwise saturate and leave
+  // equally-ranked rows in arbitrary order). Deterministic tie-break: popularity
+  // (access_count) then most-recently-updated.
   let sql = `
-    SELECT *, ts_rank(search_vector, to_tsquery('german', $1)) AS rank
+    SELECT *,
+      ts_rank(search_vector, to_tsquery('german', unaccent($1)))
+        + 0.4 * word_similarity(unaccent(lower($2)), unaccent(lower(topic))) AS rank
     FROM tc_memory.knowledge
-    WHERE search_vector @@ to_tsquery('german', $1)
+    WHERE search_vector @@ to_tsquery('german', unaccent($1))
   `;
-  const params: (string | string[] | number)[] = [tsQuery];
-  let paramIdx = 2;
+  const params: (string | string[] | number)[] = [tsQuery, query];
+  let paramIdx = 3;
 
   if (source) {
     sql += ` AND source = $${paramIdx}`;
@@ -261,7 +358,7 @@ export async function searchKnowledge(
     paramIdx++;
   }
 
-  sql += ` ORDER BY rank DESC LIMIT $${paramIdx}`;
+  sql += ` ORDER BY rank DESC, access_count DESC, updated_at DESC LIMIT $${paramIdx}`;
   params.push(Math.min(limit, 50));
 
   const result = await pool.query<KnowledgeRow>(sql, params);
@@ -271,7 +368,8 @@ export async function searchKnowledge(
     recordAccess(result.rows.map((r) => r.id)).catch(() => {});
   }
 
-  // Fallback: split query into words, ILIKE match any word against topic/content
+  // Fallback: only when full-text found nothing. Accent-insensitive ILIKE over topic/content,
+  // ranked by term coverage + the same topic word_similarity co-signal.
   if (result.rows.length === 0 && query.trim().length >= 2) {
     const words = query.split(/[\s\-_,;.]+/).filter((w) => w.length >= 3);
     if (words.length === 0) return [];
@@ -281,13 +379,15 @@ export async function searchKnowledge(
     let fuzzySql = `
       SELECT k.*,
         (SELECT COUNT(*)::float FROM unnest($1::text[]) AS pattern
-         WHERE k.topic ILIKE pattern OR k.content ILIKE pattern
-        ) / cardinality($1::text[]) AS rank
+         WHERE unaccent(k.topic) ILIKE unaccent(pattern) OR unaccent(k.content) ILIKE unaccent(pattern)
+        ) / cardinality($1::text[])
+        + 0.4 * word_similarity(unaccent(lower($2)), unaccent(lower(k.topic))) AS rank
       FROM tc_memory.knowledge k
-      WHERE k.topic ILIKE ANY($1) OR k.content ILIKE ANY($1)
+      WHERE unaccent(k.topic) ILIKE ANY(ARRAY(SELECT unaccent(p) FROM unnest($1::text[]) AS p))
+         OR unaccent(k.content) ILIKE ANY(ARRAY(SELECT unaccent(p) FROM unnest($1::text[]) AS p))
     `;
-    const fuzzyParams: (string[] | string | number)[] = [patterns];
-    let fuzzyIdx = 2;
+    const fuzzyParams: (string[] | string | number)[] = [patterns, query];
+    let fuzzyIdx = 3;
 
     if (source) {
       fuzzySql += ` AND k.source = $${fuzzyIdx}`;
@@ -300,7 +400,7 @@ export async function searchKnowledge(
       fuzzyIdx++;
     }
 
-    fuzzySql += ` ORDER BY rank DESC LIMIT $${fuzzyIdx}`;
+    fuzzySql += ` ORDER BY rank DESC, k.access_count DESC, k.updated_at DESC LIMIT $${fuzzyIdx}`;
     fuzzyParams.push(Math.min(limit, 50));
 
     const fuzzyResult = await pool.query<KnowledgeRow>(fuzzySql, fuzzyParams);
@@ -424,10 +524,17 @@ export interface HealthReport {
   never_accessed: { id: number; topic: string; source: string; created_at: Date }[];
   top_accessed: { id: number; topic: string; access_count: number; memory_type: string }[];
   stale_candidates: { id: number; topic: string; source: string; score: number; memory_type: string }[];
+  oversized: { id: number; topic: string; source: string; length: number }[];
+  duplicate_topics: { topic: string; rows: number; sources: string[] }[];
 }
 
+// Entries are meant to be atomic (one fact each). Oversized = content far over the
+// soft limit (likely a multi-topic blob that matches many queries weakly and pollutes
+// top-k). ATOMICITY_SOFT_LIMIT is advisory; the hard cap stays 2000 chars at write time.
+const ATOMICITY_SOFT_LIMIT = 1500;
+
 export async function getHealthReport(): Promise<HealthReport> {
-  const [totalRes, byTypeRes, bySourceRes, scoreRes, neverRes, topRes, staleRes] = await Promise.all([
+  const [totalRes, byTypeRes, bySourceRes, scoreRes, neverRes, topRes, staleRes, oversizedRes, dupTopicRes] = await Promise.all([
     pool.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM tc_memory.knowledge`),
     pool.query<{ memory_type: string; count: number }>(
       `SELECT memory_type, COUNT(*)::int AS count FROM tc_memory.knowledge GROUP BY memory_type ORDER BY count DESC`
@@ -465,6 +572,19 @@ export async function getHealthReport(): Promise<HealthReport> {
       ) sub WHERE score < 0.3
       ORDER BY score ASC LIMIT 10
     `),
+    pool.query<{ id: number; topic: string; source: string; length: number }>(
+      `SELECT id, topic, source, char_length(content) AS length
+       FROM tc_memory.knowledge
+       WHERE char_length(content) > $1
+       ORDER BY length DESC LIMIT 10`,
+      [ATOMICITY_SOFT_LIMIT]
+    ),
+    pool.query<{ topic: string; rows: number; sources: string[] }>(
+      `SELECT topic, COUNT(*)::int AS rows, array_agg(DISTINCT source) AS sources
+       FROM tc_memory.knowledge
+       GROUP BY topic HAVING COUNT(*) > 1
+       ORDER BY COUNT(*) DESC LIMIT 20`
+    ),
   ]);
 
   return {
@@ -475,6 +595,8 @@ export async function getHealthReport(): Promise<HealthReport> {
     never_accessed: neverRes.rows,
     top_accessed: topRes.rows,
     stale_candidates: staleRes.rows,
+    oversized: oversizedRes.rows,
+    duplicate_topics: dupTopicRes.rows,
   };
 }
 

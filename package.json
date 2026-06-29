@@ -1,6 +1,6 @@
 {
   "name": "tc-memory-server",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Shared MCP Memory Server for Team Clash",
   "type": "module",
   "scripts": {
